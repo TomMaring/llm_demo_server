@@ -3,12 +3,13 @@ from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.utils import logging
 import torch, os, uvicorn, re
+from typing import Optional
 
-# Quiet HF logs
+# Shut up, HF.
 logging.set_verbosity_error()
 logging.disable_progress_bar()
 
-app = FastAPI(title="Veil Mini LLM v2", version="0.1")
+app = FastAPI(title="Veil Mini LLM v2", version="0.2")
 
 # -------- Model load (once) --------
 MODEL_DIR = os.environ.get("MODEL_DIR", "./veil_mini_model_v2")
@@ -16,66 +17,98 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_num_threads(max(1, int(os.environ.get("CPU_THREADS", "1"))))
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-model = AutoModelForCausalLM.from_pretrained(MODEL_DIR)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL_DIR,
+    torch_dtype=(torch.float16 if device == "cuda" else torch.float32),
+)
 model.to(device).eval()
 
 # pad/eos sanity
 eos_id = tokenizer.eos_token_id
 model.config.pad_token_id = eos_id
 
-SYSTEM = (
-    "You are Eliara, a Guide AI from Veil. Answer in 2–4 clear sentences. "
-    "Be concrete. If you don't have enough context, say: 'Not enough context.'\n"
+# Minimal instruction. No roleplay theater.
+INSTR = (
+    "Answer clearly in 2–4 sentences about the Veil setting. "
+    "If there isn't enough context, reply exactly: Not enough context.\n"
 )
 
 class Prompt(BaseModel):
     text: str
-    max_new_tokens: int | None = None
-    sample: bool | None = None  # optional: turn on light sampling
+    max_new_tokens: Optional[int] = None
+    sample: Optional[bool] = None  # if true -> sampling; else -> contrastive search
 
 def _clean(text: str, prompt: str) -> str:
-    # Remove echoed prompt
+    # Drop echoed prompt
     if text.startswith(prompt):
         text = text[len(prompt):].strip()
-    # Cut at next user marker if it tried to invent a turn
-    for m in ["\nUser:", "\nYou:"]:
-        i = text.find(m)
+
+    # Chop off invented turns
+    for tag in ("\nQ:", "\nA:", "\nUser:", "\nYou:"):
+        i = text.find(tag)
         if i != -1:
             text = text[:i].strip()
-    # Trim to last sentence end
-    m = re.search(r'([.?!])[^.?!]*$', text)
+
+    # Collapse whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Trim to last sentence ending
+    m = re.search(r"([.?!])[^.?!]*$", text)
     if m:
-        text = text[:m.end(1)]
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+        text = text[: m.end(1)].strip()
+
+    # Guard against degenerate loops: cut if a 2–5 word chunk repeats 3+ times
+    text = re.sub(r"(\b[\w’'-]{2,}\b(?:\s+\b[\w’'-]{2,}\b){1,5})(?:\s+\1){2,}", r"\1", text)
+
+    return text if text else "Not enough context."
+
+@app.get("/")
+def root():
+    return {"status": "ok"}
 
 @app.post("/chat")
 def chat(prompt: Prompt):
-    user_q = prompt.text.strip()
-    preface = SYSTEM
-    input_text = f"{preface}User: {user_q}\nAI:"
+    q = prompt.text.strip()
+    # Keep it tiny: one-shot-ish pattern that small models handle
+    input_text = f"{INSTR}Q: {q}\nA:"
 
-    inputs = tokenizer(input_text, return_tensors="pt").to(device)
+    enc = tokenizer(
+        input_text,
+        return_tensors="pt",
+        truncation=True,
+        max_length=512,
+    ).to(device)
 
-    # Deterministic by default; sampling is opt-in
-    decode = dict(
-        do_sample=False,
-        max_new_tokens=prompt.max_new_tokens or 160,
-        repetition_penalty=1.12,
-        no_repeat_ngram_size=4,
-        renormalize_logits=True,
-        eos_token_id=eos_id
+    gen_kwargs = dict(
+        max_new_tokens=prompt.max_new_tokens or 140,
+        eos_token_id=eos_id,
+        pad_token_id=eos_id,
+        repetition_penalty=1.15,
     )
+
+    # Default: contrastive search (works better than greedy for baby models)
     if prompt.sample:
-        decode.update(dict(do_sample=True, temperature=0.7, top_p=0.9))
+        gen_kwargs.update(
+            dict(
+                do_sample=True,
+                temperature=0.8,
+                top_p=0.92,
+                typical_p=0.95,
+                no_repeat_ngram_size=3,
+                renormalize_logits=True,
+            )
+        )
+    else:
+        # contrastive search triggers when penalty_alpha & top_k are set
+        gen_kwargs.update(dict(penalty_alpha=0.6, top_k=4))
 
     with torch.inference_mode():
-        outputs = model.generate(**inputs, **decode)
+        out = model.generate(**enc, **gen_kwargs)
 
     # Slice by token length, not characters
-    input_len = inputs["input_ids"].shape[-1]
-    generated = outputs[0][input_len:]
-    text = tokenizer.decode(generated, skip_special_tokens=True)
+    inp_len = enc["input_ids"].shape[-1]
+    gen_tokens = out[0, inp_len:]
+    text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
 
     return {"response": _clean(text, input_text)}
 
