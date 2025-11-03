@@ -2,8 +2,9 @@ from fastapi import FastAPI
 from pydantic import BaseModel
 from transformers import AutoTokenizer, AutoModelForCausalLM, __version__ as hf_version
 from transformers.utils import logging
-import torch, os, uvicorn, re
 from typing import Optional
+from fastapi.middleware.cors import CORSMiddleware
+import torch, os, uvicorn, re, os
 
 # Quiet HF noise
 logging.set_verbosity_error()
@@ -13,7 +14,27 @@ APP_VERSION = "0.3"
 
 app = FastAPI(title="Veil Mini LLM v2", version=APP_VERSION)
 
-# -------- Model load (once) --------
+# ---------- CORS ----------
+_default_origins = [
+    "https://www.crynance.app",
+    "https://crynance.app",
+    "http://localhost:5173",
+    "http://localhost:3000",
+]
+origins = os.environ.get("ALLOWED_ORIGINS", ",".join(_default_origins)).split(",")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[o.strip() for o in origins],
+    allow_credentials=True,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+    max_age=86400,  # cache the preflight for a day
+)
+# -----------------------------------------------------
+
+# -------- Model load --------
 MODEL_DIR = os.environ.get("MODEL_DIR", "./veil_mini_model_v2")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_num_threads(max(1, int(os.environ.get("CPU_THREADS", "1"))))
@@ -21,7 +42,7 @@ torch.set_num_threads(max(1, int(os.environ.get("CPU_THREADS", "1"))))
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
 model = AutoModelForCausalLM.from_pretrained(MODEL_DIR).to(device).eval()
 
-# pad/eos sanity
+# pad/eos
 eos_id = tokenizer.eos_token_id
 model.config.pad_token_id = eos_id
 
