@@ -2,7 +2,13 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
-from transformers import AutoTokenizer, AutoModelForCausalLM, __version__ as hf_version
+from transformers import (
+    AutoTokenizer,
+    AutoModelForCausalLM,
+    __version__ as hf_version,
+    StoppingCriteriaList,
+    StoppingCriteria,
+)
 from transformers.utils import logging
 from typing import Optional, List
 import torch, os, uvicorn, re
@@ -11,7 +17,7 @@ import torch, os, uvicorn, re
 logging.set_verbosity_error()
 logging.disable_progress_bar()
 
-APP_VERSION = "0.4"  # bumped
+APP_VERSION = "0.5"
 
 app = FastAPI(title="Veil Mini LLM v2", version=APP_VERSION)
 
@@ -44,16 +50,25 @@ DEMO_MODE = os.environ.get("DEMO_MODE", "0") == "1"
 device = "cuda" if torch.cuda.is_available() else "cpu"
 torch.set_num_threads(CPU_THREADS)
 
+# Prefer half precision on CUDA for speed/VRAM. CPU stays float32.
+load_dtype = torch.float16 if device == "cuda" else torch.float32
+
 tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-model = AutoModelForCausalLM.from_pretrained(MODEL_DIR).to(device).eval()
+model = AutoModelForCausalLM.from_pretrained(MODEL_DIR, torch_dtype=load_dtype).to(device).eval()
 
-# pad/eos
+# eos/pad id sanity
 eos_id = tokenizer.eos_token_id
+if eos_id is None:
+    # very defensive; most LMs have an eos
+    tokenizer.eos_token = tokenizer.eos_token or "</s>"
+    eos_id = tokenizer.eos_token_id
 model.config.pad_token_id = eos_id
+tokenizer.pad_token_id = eos_id
 
-SYSTEM = (
+SYSTEM = os.environ.get(
+    "SYSTEM_PROMPT",
     "You are Eliara, a Guide AI from Veil. Answer in 2–4 concrete sentences. "
-    "If the question lacks Veil context, reply exactly: 'Not enough context.'\n"
+    "If the question lacks Veil context, reply exactly: 'Not enough context.'\n",
 )
 
 # --- Demo fallbacks --------------------------------
@@ -75,7 +90,7 @@ def _looks_ok(s: str) -> bool:
     letters = sum(ch.isalpha() for ch in s)
     ratio = letters / max(1, len(s))
     end_punct = any(s.strip().endswith(p) for p in (".", "?", "!"))
-    return 8 <= words <= 40 and ratio > 0.65 and end_punct
+    return 8 <= words <= 60 and ratio > 0.55 and end_punct
 
 # --- Request schema -----------------------------------------------------------
 class Prompt(BaseModel):
@@ -122,9 +137,36 @@ def _clean(text: str, prompt: str) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 def _apply_stop(s: str, stops: Optional[List[str]]) -> str:
-    if not stops: return s
+    if not stops:
+        return s
     idx = min((s.find(t) for t in stops if t in s), default=-1)
     return s[:idx] if idx >= 0 else s
+
+class StopOnTokenSeq(StoppingCriteria):
+    """Stops when any encoded stop sequence occurs at the end of the output."""
+    def __init__(self, stop_sequences: List[List[int]]):
+        super().__init__()
+        # filter out empties
+        self.stop_sequences = [seq for seq in stop_sequences if seq]
+
+    def __call__(self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs) -> bool:
+        if not self.stop_sequences:
+            return False
+        seq = input_ids[0].tolist()
+        for stop in self.stop_sequences:
+            n = len(stop)
+            if n <= len(seq) and seq[-n:] == stop:
+                return True
+        return False
+
+def _make_stoppers(stops: Optional[List[str]]) -> Optional[StoppingCriteriaList]:
+    if not stops:
+        return None
+    # encode each stop without special tokens
+    encoded = [tokenizer.encode(s, add_special_tokens=False) for s in stops if s]
+    if not encoded:
+        return None
+    return StoppingCriteriaList([StopOnTokenSeq(encoded)])
 
 # --- Endpoints ----------------------------------------------------------------
 @app.get("/")
@@ -148,7 +190,7 @@ def chat(prompt: Prompt):
     input_text = f"{preface}User: {user_q}\nAI:"
     enc = tokenizer(input_text, return_tensors="pt").to(device)
 
-    # Effective knobs with defaults
+    # Effective knobs with defaults (mirrors UI)
     max_new = (
         prompt.max_new_tokens
         or prompt.tokens
@@ -156,7 +198,8 @@ def chat(prompt: Prompt):
     )
     max_new = max(1, min(HARD_MAX_NEW, int(max_new)))
 
-    mode = (prompt.mode or ("sample" if prompt.sample else None) or "contrastive").lower()
+    mode = (prompt.mode or ("sample" if prompt.sample else None) or "contrastive").lower().strip()
+    # do_sample is true if you asked for 'sample' mode or any sampling knobs were provided
     do_sample = bool(
         prompt.do_sample
         or prompt.sample
@@ -164,17 +207,24 @@ def chat(prompt: Prompt):
         or any(v is not None for v in (prompt.temperature, prompt.top_p))
     )
 
-    penalty_alpha = prompt.penalty_alpha if prompt.penalty_alpha is not None else 0.25
-    top_k = prompt.top_k if prompt.top_k is not None else 4
+    # explicit defaults, matching the UI defaults you send
+    penalty_alpha = 0.25 if prompt.penalty_alpha is None else float(prompt.penalty_alpha)
+    top_k = 4 if prompt.top_k is None else int(prompt.top_k)
     temperature = 0.7 if prompt.temperature is None else float(prompt.temperature)
     top_p = 0.9 if prompt.top_p is None else float(prompt.top_p)
     repetition_penalty = float(prompt.repetition_penalty or 1.12)
     no_repeat = int(prompt.no_repeat_ngram_size or 4)
+    no_repeat = max(0, min(10, no_repeat))
 
     if prompt.seed is not None:
         torch.manual_seed(int(prompt.seed))
+        if device == "cuda":
+            torch.cuda.manual_seed_all(int(prompt.seed))
 
-    # Generation kwargs
+    # Build stopping criteria from 'stop' tokens (and keep post-trim just in case)
+    stoppers = _make_stoppers(prompt.stop)
+
+    # Base kwargs shared by both strategies
     base_kwargs = dict(
         max_new_tokens=max_new,
         no_repeat_ngram_size=no_repeat,
@@ -182,38 +232,57 @@ def chat(prompt: Prompt):
         renormalize_logits=True,
         eos_token_id=eos_id,
         pad_token_id=eos_id,
+        stopping_criteria=stoppers,
+        use_cache=True,
     )
 
     if do_sample:
+        # nucleus/top-k sampling
         gen_kwargs = dict(
             **base_kwargs,
             do_sample=True,
             temperature=temperature,
             top_p=top_p,
-            # honor explicit top_k if given while sampling
-            **({"top_k": top_k} if prompt.top_k is not None else {}),
+            top_k=top_k,  # your UI always sends a value; honor it
         )
     else:
-        # contrastive search path
+        # contrastive search requires top_k >= 2
         gen_kwargs = dict(
             **base_kwargs,
             do_sample=False,
-            penalty_alpha=penalty_alpha,
-            top_k=top_k,
+            penalty_alpha=max(1e-6, penalty_alpha),
+            top_k=max(2, top_k),
         )
 
+    # Generate
     with torch.inference_mode():
-        try:
-            out = model.generate(**enc, **gen_kwargs)
-        except Exception:
-            # Fallback to safe nucleus sampling if contrastive misbehaves
-            fallback = dict(
-                **base_kwargs,
-                do_sample=True,
-                temperature=0.8,
-                top_p=0.9,
-            )
-            out = model.generate(**enc, **fallback)
+        if device == "cuda":
+            # modest perf boost on consumer GPUs, no API changes
+            with torch.cuda.amp.autocast(dtype=torch.float16):
+                try:
+                    out = model.generate(**enc, **gen_kwargs)
+                except Exception:
+                    # Safe fallback to sampling if contrastive path misbehaves
+                    fallback = dict(
+                        **base_kwargs,
+                        do_sample=True,
+                        temperature=0.8,
+                        top_p=0.9,
+                        top_k=top_k,
+                    )
+                    out = model.generate(**enc, **fallback)
+        else:
+            try:
+                out = model.generate(**enc, **gen_kwargs)
+            except Exception:
+                fallback = dict(
+                    **base_kwargs,
+                    do_sample=True,
+                    temperature=0.8,
+                    top_p=0.9,
+                    top_k=top_k,
+                )
+                out = model.generate(**enc, **fallback)
 
     # Decode
     ilen = enc["input_ids"].shape[-1]
@@ -245,12 +314,13 @@ def chat(prompt: Prompt):
                 "total_tokens": total_tokens,
             },
             "params": {
+                # echo back the effective knobs so the UI debug panel matches reality
                 "mode": "sample" if do_sample else "contrastive",
                 "max_new_tokens": max_new,
                 "temperature": temperature if do_sample else None,
                 "top_p": top_p if do_sample else None,
-                "top_k": top_k,
-                "penalty_alpha": penalty_alpha if not do_sample else None,
+                "top_k": top_k if do_sample else max(2, top_k),
+                "penalty_alpha": None if do_sample else max(1e-6, penalty_alpha),
                 "repetition_penalty": repetition_penalty,
                 "no_repeat_ngram_size": no_repeat,
                 "seed": prompt.seed,
