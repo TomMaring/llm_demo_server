@@ -56,7 +56,7 @@ SYSTEM = (
     "If the question lacks Veil context, reply exactly: 'Not enough context.'\n"
 )
 
-# --- Demo fallbacks (optional, for interviews) --------------------------------
+# --- Demo fallbacks --------------------------------
 CANON = {
     "who is reven": "Reven is the stubborn, clear-eyed Subject who treats his Guide AI as a partner, and that choice cracks the Veil.",
     "what is veil": "Veil is a shared dreamscape experiment where presence and memory shape reality and choices leave visible echoes.",
@@ -148,7 +148,7 @@ def chat(prompt: Prompt):
     input_text = f"{preface}User: {user_q}\nAI:"
     enc = tokenizer(input_text, return_tensors="pt").to(device)
 
-    # Effective knobs with sane defaults
+    # Effective knobs with defaults
     max_new = (
         prompt.max_new_tokens
         or prompt.tokens
