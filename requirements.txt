@@ -1,6 +1,5 @@
-fastapi
-uvicorn
+fastapi==0.115.*
+uvicorn==0.32.*
 transformers==4.57.1
-tokenizers>=0.22,<0.24
-safetensors
-torch==2.5.1           # CPU wheel on Render; no CUDA there
+torch==2.5.*
+pydantic==2.9.*
