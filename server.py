@@ -1,15 +1,17 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, __version__ as hf_version
 from transformers.utils import logging
 import torch, os, uvicorn, re
 from typing import Optional
 
-# Quiet HF logs
+# Quiet HF noise
 logging.set_verbosity_error()
 logging.disable_progress_bar()
 
-app = FastAPI(title="Veil Mini LLM v2", version="0.3")
+APP_VERSION = "0.3"
+
+app = FastAPI(title="Veil Mini LLM v2", version=APP_VERSION)
 
 # -------- Model load (once) --------
 MODEL_DIR = os.environ.get("MODEL_DIR", "./veil_mini_model_v2")
@@ -31,14 +33,14 @@ SYSTEM = (
 class Prompt(BaseModel):
     text: str
     max_new_tokens: Optional[int] = None
-    sample: Optional[bool] = None  # optional: enable light sampling
+    sample: Optional[bool] = None  # optional: allow light sampling
 
 def _clean(text: str, prompt: str) -> str:
     # Remove echoed prompt
     if text.startswith(prompt):
         text = text[len(prompt):].strip()
 
-    # Stop if the model tries to start a new user turn
+    # Stop if the model tries to begin a new user turn
     for m in ["\nUser:", "\nYou:", "\nHuman:", "\nQ:"]:
         i = text.find(m)
         if i != -1:
@@ -50,11 +52,19 @@ def _clean(text: str, prompt: str) -> str:
         text = text[:m.end(1)]
     return re.sub(r"\s+", " ", text).strip()
 
+@app.get("/")
+def root():
+    return {"ok": True, "app": "veil-mini-llm", "version": APP_VERSION}
+
 @app.get("/health")
 def health():
     p = os.path.join(MODEL_DIR, "model.safetensors")
     size = os.path.getsize(p) if os.path.exists(p) else 0
     return {"device": device, "model_dir": MODEL_DIR, "model_bytes": size}
+
+@app.get("/version")
+def version():
+    return {"app_version": APP_VERSION, "transformers": hf_version}
 
 @app.post("/chat")
 def chat(prompt: Prompt):
@@ -63,13 +73,12 @@ def chat(prompt: Prompt):
     input_text = f"{preface}User: {user_q}\nAI:"
     enc = tokenizer(input_text, return_tensors="pt").to(device)
 
-    # --- Decoding ---
-    # Use native contrastive search (no 'decoding=' param!)
+    # Try native contrastive search first (supported on HF 4.57.1)
     gen_kwargs = dict(
         max_new_tokens=prompt.max_new_tokens or 160,
-        do_sample=False,               # contrastive is deterministic by default
-        penalty_alpha=0.25,            # tune if needed (0.3–0.6 increases contrast)
-        top_k=4,                       # small k for a tiny model
+        do_sample=False,
+        penalty_alpha=0.25,    # increase (0.3–0.6) for more contrast
+        top_k=4,
         no_repeat_ngram_size=4,
         repetition_penalty=1.12,
         renormalize_logits=True,
@@ -81,9 +90,19 @@ def chat(prompt: Prompt):
         gen_kwargs.update(dict(do_sample=True, temperature=0.7, top_p=0.9))
 
     with torch.inference_mode():
-        out = model.generate(**enc, **gen_kwargs)
+        try:
+            out = model.generate(**enc, **gen_kwargs)
+        except Exception:
+            # Fallback to nucleus sampling if something odd happens
+            fallback = dict(
+                max_new_tokens=prompt.max_new_tokens or 160,
+                do_sample=True, temperature=0.8, top_p=0.9,
+                no_repeat_ngram_size=4, repetition_penalty=1.12,
+                renormalize_logits=True, eos_token_id=eos_id,
+            )
+            out = model.generate(**enc, **fallback)
 
-    # Slice by token count, not chars
+    # Slice by token count
     ilen = enc["input_ids"].shape[-1]
     gen_tokens = out[0][ilen:]
     text = tokenizer.decode(gen_tokens, skip_special_tokens=True)
